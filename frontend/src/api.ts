@@ -48,6 +48,15 @@ export async function resetGame(id: string): Promise<GameState> {
   return response.data.data;
 }
 
+export async function checkHealth(): Promise<boolean> {
+  try {
+    const response = await api.get('/health', { timeout: 3000 });
+    return response.data?.status === 'ok';
+  } catch {
+    return false;
+  }
+}
+
 export async function findPath(id: string, from: HexCoord, to: HexCoord): Promise<HexCoord[] | null> {
   try {
     const response = await api.post<ApiResponse<HexCoord[]>>(`/games/${id}/find-path`, { from, to });

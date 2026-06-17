@@ -3,6 +3,7 @@ import { GameState, HexCoord, HexType } from './types';
 import { HexGridRenderer } from './hexGrid';
 import { createGame, getGame, extendMycelium, undoMove, resetGame, findPath } from './api';
 import { coordKey, findPathAStar, PixelCoord } from './hexUtils';
+import { ServiceGuard } from './serviceGuard';
 
 type MessageType = 'info' | 'success' | 'error';
 
@@ -21,6 +22,8 @@ export class FungiGame {
   private messageTimeout: any = null;
   private isProcessing = false;
   private previewPathCoord: HexCoord | null = null;
+  private serviceGuard: ServiceGuard;
+  private pendingAction: (() => Promise<void>) | null = null;
 
   constructor() {
     const hexContainer = document.getElementById('hex-container')!;
@@ -35,12 +38,25 @@ export class FungiGame {
       onCellHover: (coord, pixel) => this.handleCellHover(coord, pixel),
     });
 
+    this.serviceGuard = new ServiceGuard({
+      onReconnect: () => this.handleReconnect(),
+      onDisconnect: () => this.handleDisconnect(),
+    });
+
     this.initUI();
   }
 
-  private initUI(): void {
+  private async initUI(): Promise<void> {
     this.renderPanel();
-    this.startNewGame(this.selectedLevel);
+    this.showMessage('正在连接后端服务...', 'info');
+
+    const ok = await this.serviceGuard.check();
+    if (ok) {
+      this.serviceGuard.startPolling();
+      this.startNewGame(this.selectedLevel);
+    } else {
+      this.showMessage('无法连接后端服务，请检查后端是否启动', 'error');
+    }
   }
 
   private renderPanel(): void {
@@ -288,20 +304,26 @@ export class FungiGame {
     this.setProcessing(true);
     this.showMessage('正在生成新地图...', 'info');
 
-    try {
+    const ok = await this.guardAction(async () => {
       this.gameState = await createGame(level);
       this.hexGrid.setGameState(this.gameState);
       this.showMessage(`第 ${level} 关开始！连接所有腐木营养源`, 'success');
       this.renderPanel();
-    } catch (e) {
-      this.showMessage('创建游戏失败：' + (e instanceof Error ? e.message : '未知错误'), 'error');
-    } finally {
-      this.setProcessing(false);
+    });
+
+    if (!ok && this.serviceGuard.isOffline) {
+      this.pendingAction = () => this.startNewGame(level);
+      this.showMessage('后端服务不可用，等待恢复后自动重试...', 'error');
+    } else if (!ok) {
+      this.showMessage('创建游戏失败：后端服务不可用', 'error');
     }
+
+    this.setProcessing(false);
   }
 
   private async handleCellClick(coord: HexCoord): Promise<void> {
     if (this.isProcessing || !this.gameState || this.gameState.status !== 'playing') return;
+    if (this.serviceGuard.isOffline) return;
 
     const key = coordKey(coord);
     const cell = this.gameState.cells[key];
@@ -314,24 +336,28 @@ export class FungiGame {
 
     this.setProcessing(true);
 
-    try {
-      this.gameState = await extendMycelium(this.gameState.id, coord);
+    const ok = await this.guardAction(async () => {
+      this.gameState = await extendMycelium(this.gameState!.id, coord);
       this.hexGrid.setGameState(this.gameState);
       this.hexGrid.showPathPreview(null);
       this.previewPathCoord = null;
 
-      if (this.gameState.status === 'won') {
+      if (this.gameState!.status === 'won') {
         this.showMessage('🎊 恭喜！成功连接所有营养源！', 'success');
-      } else if (cell.type === HexType.NUTRIENT && cell.nutrientId && this.gameState.connectedNutrients.includes(cell.nutrientId)) {
+      } else if (cell.type === HexType.NUTRIENT && cell.nutrientId && this.gameState!.connectedNutrients.includes(cell.nutrientId)) {
         this.showMessage('✅ 成功连接一个营养源！', 'success');
       }
 
       this.renderPanel();
-    } catch (e) {
-      this.showMessage(e instanceof Error ? e.message : '操作失败', 'error');
-    } finally {
-      this.setProcessing(false);
+    });
+
+    if (!ok && this.serviceGuard.isOffline) {
+      this.pendingAction = () => this.handleCellClick(coord);
+    } else if (!ok) {
+      this.showMessage('操作失败：后端服务不可用', 'error');
     }
+
+    this.setProcessing(false);
   }
 
   private handleCellHover(coord: HexCoord | null, pixel: PixelCoord | null): void {
@@ -386,37 +412,82 @@ export class FungiGame {
   }
 
   private async handleUndo(): Promise<void> {
-    if (!this.gameState) return;
+    if (!this.gameState || this.serviceGuard.isOffline) return;
     this.setProcessing(true);
 
-    try {
-      this.gameState = await undoMove(this.gameState.id);
+    const ok = await this.guardAction(async () => {
+      this.gameState = await undoMove(this.gameState!.id);
       this.hexGrid.setGameState(this.gameState);
       this.hexGrid.showPathPreview(null);
       this.showMessage('↩️ 已撤销上一步', 'info');
       this.renderPanel();
-    } catch (e) {
-      this.showMessage(e instanceof Error ? e.message : '撤销失败', 'error');
-    } finally {
-      this.setProcessing(false);
+    });
+
+    if (!ok && this.serviceGuard.isOffline) {
+      this.pendingAction = () => this.handleUndo();
+      this.showMessage('后端服务不可用，等待恢复后自动重试...', 'error');
+    } else if (!ok) {
+      this.showMessage('撤销失败：后端服务不可用', 'error');
     }
+
+    this.setProcessing(false);
   }
 
   private async handleReset(): Promise<void> {
-    if (!this.gameState) return;
+    if (!this.gameState || this.serviceGuard.isOffline) return;
     this.setProcessing(true);
     this.showMessage('正在重置...', 'info');
 
-    try {
-      this.gameState = await resetGame(this.gameState.id);
+    const ok = await this.guardAction(async () => {
+      this.gameState = await resetGame(this.gameState!.id);
       this.hexGrid.setGameState(this.gameState);
       this.hexGrid.showPathPreview(null);
       this.showMessage('🔄 关卡已重置', 'info');
       this.renderPanel();
-    } catch (e) {
-      this.showMessage(e instanceof Error ? e.message : '重置失败', 'error');
-    } finally {
-      this.setProcessing(false);
+    });
+
+    if (!ok && this.serviceGuard.isOffline) {
+      this.pendingAction = () => this.handleReset();
+      this.showMessage('后端服务不可用，等待恢复后自动重试...', 'error');
+    } else if (!ok) {
+      this.showMessage('重置失败：后端服务不可用', 'error');
+    }
+
+    this.setProcessing(false);
+  }
+
+  private async guardAction(action: () => Promise<void>): Promise<boolean> {
+    if (this.serviceGuard.isOffline) return false;
+    const ok = await this.serviceGuard.check();
+    if (!ok) return false;
+    await action();
+    return true;
+  }
+
+  private handleDisconnect(): void {
+    this.showMessage('⚠️ 后端服务已断开，等待重新连接...', 'error');
+  }
+
+  private async handleReconnect(): Promise<void> {
+    this.showMessage('✅ 后端服务已恢复', 'success');
+
+    if (this.pendingAction) {
+      const action = this.pendingAction;
+      this.pendingAction = null;
+      await action();
+      return;
+    }
+
+    if (this.gameState) {
+      try {
+        this.gameState = await getGame(this.gameState.id);
+        this.hexGrid.setGameState(this.gameState);
+        this.renderPanel();
+      } catch {
+        this.startNewGame(this.selectedLevel);
+      }
+    } else {
+      this.startNewGame(this.selectedLevel);
     }
   }
 
