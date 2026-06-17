@@ -11,6 +11,8 @@ export class ServiceGuard {
   private statusText: HTMLElement | null = null;
   private onReconnect: (() => void) | null = null;
   private onDisconnect: (() => void) | null = null;
+  private checkLock: Promise<boolean> | null = null;
+  private callbacksFiredFor: 'online' | 'offline' | null = null;
 
   constructor(options: {
     onReconnect?: () => void;
@@ -29,19 +31,37 @@ export class ServiceGuard {
   }
 
   async check(): Promise<boolean> {
-    const ok = await checkHealth();
-    const prev = this.status;
-    this.status = ok ? 'online' : 'offline';
+    if (this.checkLock) return this.checkLock;
+    const previousStatus = this.status;
 
-    if (prev !== 'offline' && this.status === 'offline') {
-      this.onDisconnect?.();
-      this.showOverlay();
-    } else if (prev === 'offline' && this.status === 'online') {
-      this.onReconnect?.();
-      this.hideOverlay();
-    }
+    this.checkLock = (async (): Promise<boolean> => {
+      try {
+        this.status = 'checking';
+        const ok = await checkHealth();
+        const newStatus: GuardStatus = ok ? 'online' : 'offline';
+        this.status = newStatus;
 
-    return ok;
+        if (newStatus === 'offline') {
+          if (this.callbacksFiredFor !== 'offline') {
+            this.callbacksFiredFor = 'offline';
+            try { this.onDisconnect?.(); } catch {}
+          }
+          this.showOverlay();
+        } else {
+          if (this.callbacksFiredFor !== 'online' && previousStatus !== 'online') {
+            this.callbacksFiredFor = 'online';
+            try { this.onReconnect?.(); } catch {}
+          }
+          this.hideOverlay();
+        }
+
+        return ok;
+      } finally {
+        this.checkLock = null;
+      }
+    })();
+
+    return this.checkLock;
   }
 
   startPolling(interval: number = 5000): void {
@@ -82,7 +102,7 @@ export class ServiceGuard {
 
     this.statusText = document.createElement('div');
     this.statusText.className = 'service-guard-status';
-    this.statusText.textContent = '正在尝试重新连接...';
+    this.statusText.textContent = this.pollTimer ? '后台正在自动重试...' : '点击下方按钮检查后端服务';
 
     const retryBtn = document.createElement('button');
     retryBtn.className = 'btn btn-primary service-guard-retry-btn';
@@ -134,5 +154,6 @@ export class ServiceGuard {
   destroy(): void {
     this.stopPolling();
     this.hideOverlay();
+    this.checkLock = null;
   }
 }
